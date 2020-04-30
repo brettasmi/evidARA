@@ -5,6 +5,7 @@
 # locals
 from evidara_api.__main__ import get_db
 from evidara_api.basic_query import BasicQuery
+from evidara_api.cohort_query import CohortQuery
 from evidara_api.biggim import BigGimRequester
 from evidara_api import models
 from evidara_api.util import get_evidara_logger
@@ -44,14 +45,31 @@ def process_query(query):
         edges = [models.QEdge(**edge) for edge in query_graph.edges]
     except TypeError as e:
         return f"Bad Request with keyword {str(e).split()[-1]}", 400
-
-    # TODO: logic for different query types
-    querier = BasicQuery(
-        nodes, edges, query_message.query_options, query_message.n_results, kp_caches
+    # set empty query options for non-error lookups
+    query_options = query_message.query_options if query_message.query_options else {}
+    queriers, results = [], []
+    if "evidentiary" in query_options:
+        queriers.append(
+            CohortQuery(nodes, edges, query_message.query_options, 200, kp_caches)
+        )
+    queriers.append(
+        BasicQuery(nodes, edges, query_message.query_options, 200, kp_caches)
     )
     # now query SPOKE
     with get_db() as session:
-        res = querier.linear_spoke_query(session)
-        if isinstance(res, str):
-            return res, 400
-    return res
+        for querier in queriers:
+            res, query_order = querier.spoke_query(session)
+            if isinstance(res, str):
+                return res, 400
+            results.extend(res)
+            if len(results) > 200:
+                break
+
+        # check BigGIM, currently here, but a better `process_results`
+        # function should be created in the future
+        results = kp_caches["big_gim"].annotate_edges_with_biggim(
+            session, query_order, results, query_options.get("psev-context"),
+        )
+
+    knowledge = {"results": sorted(results, key=lambda x: x.score, reverse=True)[:20]}
+    return knowledge

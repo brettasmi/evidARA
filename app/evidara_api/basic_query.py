@@ -32,10 +32,6 @@ class BasicQuery:
         self.result_nodes = {}
         self.caches = caches
 
-        # check for query_options and replace saves lots of `if`ing later
-        if not query_options:
-            self.query_options = {}
-
     def query_setup(self):
         """"""
         # get nodes as dict for later lookup by identifier
@@ -191,9 +187,7 @@ class BasicQuery:
                 else:
                     raise MissingComponentError(f"Missing one of {next_node}")
 
-    def make_evidara_result(
-        self, n4j_result, record_number, query_names, query_mapping
-    ):
+    def make_evidara_result(self, n4j_result, record_number):
         """Constructs a reasoner-standard result from the result of a neo4j 
         query
 
@@ -202,10 +196,6 @@ class BasicQuery:
         n4j_result (neo4j.BoltStatementResult): result of a SPOKE Cypher
             query
         record_number (int): record index
-        query_names (str): string of letters corresponding to aliases in
-            `n4j_result`
-        query_mapping (dict): str -> str mappings of QNode/QEdge ids to
-            query names
 
         Returns
         -------
@@ -216,17 +206,17 @@ class BasicQuery:
         result_nodes, result_edges = [], []
         knowledge_map = {"edges": {}, "nodes": {}}
         # iterate through results and add to result objects
-        for name in query_names:
+        for name in self.query_names:
             if isinstance(n4j_result[name], neo4j.types.graph.Node):
                 result_nodes.append(self.make_result_node(n4j_result[name]))
-                knowledge_map["nodes"][query_mapping["nodes"][name]] = result_nodes[
-                    -1
-                ].id
+                knowledge_map["nodes"][
+                    self.query_mapping["nodes"][name]
+                ] = result_nodes[-1].id
             else:
                 result_edges.append(self.make_result_edge(n4j_result[name]))
-                knowledge_map["edges"][query_mapping["edges"][name]] = result_edges[
-                    -1
-                ].id
+                knowledge_map["edges"][
+                    self.query_mapping["edges"][name]
+                ] = result_edges[-1].id
         # score result, instiate result objects and return
         scores = self.get_result_score(result_nodes, result_edges)
         result_knowledge_graph = models.KnowledgeGraph(result_nodes, result_edges)
@@ -389,7 +379,23 @@ class BasicQuery:
         ]
         return result_edge
 
-    def linear_spoke_query(self, session):
+    def get_query_string(self):
+        """Returns a Cypher string to pass to SPOKE"""
+        # spoke diameter is <7 but consider enforcing max query length anyway
+        # possibly enforce a max on the query too
+        self.query_names = "abcdefghijklmn"[: len(self.query_order)]
+        query_parts = []
+        self.query_mapping = {"edges": {}, "nodes": {}}
+        for query_part, name in zip(self.query_order, self.query_names):
+            query_parts.append(self.get_n4j_str_repr(query_part, name))
+            if isinstance(query_part, models.QNode):
+                self.query_mapping["nodes"][name] = query_part.node_id
+            else:
+                self.query_mapping["edges"][name] = query_part.edge_id
+        query_string = "-".join(query_parts)
+        return f"match p = {query_string} " f"return * limit {self.n_results}"
+
+    def spoke_query(self, session):
         """Returns the SPOKE node label equivalent to `node_type`
 
         Parameters
@@ -405,40 +411,13 @@ class BasicQuery:
         try:
             self.query_setup()
         except (NotImplementedError, MissingComponentError) as e:
-            return e
-
-        # spoke diameter is <7 but consider enforcing max query length anyway
-        query_names = "abcdefghijklmn"[: len(self.query_order)]
-        query_parts = []
-        query_mapping = {"edges": {}, "nodes": {}}
-        for query_part, name in zip(self.query_order, query_names):
-            query_parts.append(self.get_n4j_str_repr(query_part, name))
-            if isinstance(query_part, models.QNode):
-                query_mapping["nodes"][name] = query_part.node_id
-            else:
-                query_mapping["edges"][name] = query_part.edge_id
-        query_string = "-".join(query_parts)
-        # set max results b/c reasoner-standard default is None
-        # possibly enforce a max on the query too
-        r = session.run(f"match p = {query_string} " f"return * limit {self.n_results}")
+            return e, None
+        query_string = self.get_query_string()
+        r = session.run(query_string)
 
         # create the results, then sort on score
-        results = sorted(
-            [
-                self.make_evidara_result(record, i, query_names, query_mapping)
-                for i, record in enumerate(r.records())
-            ],
-            key=lambda x: x.score,
-            reverse=True,
-        )[:20]
+        results = [
+            self.make_evidara_result(record, i) for i, record in enumerate(r.records())
+        ]
 
-        # check BigGIM, currently here, but a better `process_results`
-        # function should be created in the future
-        if "big_gim" in self.caches:
-            results = self.caches["big_gim"].annotate_edges_with_biggim(
-                session,
-                self.query_order,
-                results,
-                self.query_options.get("psev-context"),
-            )
-        return {"results": results}
+        return results, self.query_order
